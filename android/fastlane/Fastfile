@@ -1,0 +1,182 @@
+# This file contains the fastlane.tools configuration
+# You can find the documentation at https://docs.fastlane.tools
+#
+# For a list of all available actions, check out
+#
+#     https://docs.fastlane.tools/actions
+#
+# For a list of all available plugins, check out
+#
+#     https://docs.fastlane.tools/plugins/available-plugins
+#
+
+# Prerequisites
+# 1. Create a keystore - https://flutter.dev/docs/deployment/android#create-a-keystore
+#
+# 2. Create API access from Google Service accounts
+# 2.1. Download json file and keep in safe place
+# 2.2. In Appfile add json_key_file with Path to the json secret file - Follow https://docs.fastlane.tools/actions/supply/#setup to get one
+#
+# 3. Plugins in Pluginfile
+# gem 'fastlane-plugin-telegram'
+# gem 'fastlane-plugin-flutter_version'
+
+# Uncomment the line if you want fastlane to automatically update itself
+# update_fastlane
+
+default_platform(:android)
+
+ENV['app_identifier'] = 'com.example.app'
+ENV['app_name_sanitized'] = 'Android APP NAME'
+
+platform :android do
+
+  version_name = '1.0.0'
+  version_code = 1
+  increase_version_code = nil
+  metadata_android_path = './fastlane/metadata/android'
+
+  apk_file = '../build/app/outputs/flutter-apk/app-release.apk'
+  aab_file = '../build/app/outputs/bundle/release/app-release.aab'
+
+  before_all do
+    # Get version code from track in google play
+
+    fetchVersion()
+  end
+
+  desc "Read flutter app version info from local(pubspec.yaml)"
+  lane :readVersion do
+    version_name = flutter_version()["version_name"]
+    version_code = flutter_version()["version_code"]
+    increase_version_code = version_code.to_i + 1
+  end
+
+  desc "Fetch flutter app version info from google play track"
+  lane :fetchVersion do
+    version_name = flutter_version()["version_name"]
+    versions = google_play_track_version_codes(track: "internal")
+    version_code = versions[0]
+    increase_version_code = version_code + 1
+  end
+
+  desc "Runs all the tests"
+  lane :test do
+    gradle(task: "test")
+  end
+
+  desc "Deploy a new version to the Google Play Internal"
+  lane :beta do
+    # RegExr for increasing build number. e.g v1.0.0+1 > v1.0.0+2
+    increase_pubspec_build_number = 's/^(version:\\s+\d+\.\d+\.\d+\+)(\d+)$/$1.(' + "#{increase_version_code}" + ')/e'
+
+    Dir.chdir ".." do
+      sh("perl", "-i", "-pe", increase_pubspec_build_number, "../pubspec.yaml") # Bump pubspec's build number
+      sh("flutter", "packages", "get")
+      sh("flutter", "clean")
+      #sh("flutter", "build", "apk", "--release", ""--build-name=#{version_name}", "--build-number=#{increase_version_code}")
+      sh("flutter", "build", "appbundle", "--release", "--build-name=#{version_name}", "--build-number=#{increase_version_code}")
+    end
+
+    supply(
+        package_name: ENV['app_identifier'],
+        track: 'internal',
+        #apk: apk_file,
+        aab: aab_file,
+        skip_upload_images: true,
+        skip_upload_screenshots: true,
+        skip_upload_metadata: true,
+        version_code: increase_version_code,
+        version_name: "v#{version_name} - Beta #{increase_version_code}"
+    )
+
+    upload_to_play_store(track: 'internal', version_code: increase_version_code)
+    chatbot_telegram(build_number:increase_version_code)
+  end
+
+  desc "Deploy a new version to the Google Play Alpha"
+  lane :alpha do
+    track_promote(
+      track: 'internal',
+      rollout: '1.0',
+      track_promote_to: 'alpha'
+    )
+  end
+
+  desc "Deploy a new version to the Google Play Open"
+  lane :open do
+    track_promote(
+      track: 'internal',
+      rollout: '1.0',
+      track_promote_to: 'beta'
+    )
+  end
+
+  desc "*** Not Working Yet *** Deploy a new version to the Google Play Production"
+  lane :deploy do |options|
+    # Build new beta file
+    # beta()
+
+    supply(
+      package_name: ENV['app_identifier'],
+      track: 'beta',
+      track_promote_to: 'production',
+      rollout: options[:rollout] || '0.25', # 0.25
+      version_code: version_code,
+      skip_upload_metadata: true,
+      skip_upload_images: true,
+      skip_upload_screenshots: true,
+      skip_upload_changelogs: true,
+      skip_upload_apk: true,
+      skip_upload_aab: true
+    )
+  end
+
+  desc "Promote track to another track"
+  lane :track_promote do |options|
+    source_track = options[:track] || 'internal'
+    rollout_value = options[:rollout] || '1.0'
+    promote_track = options[:track_promote_to] || 'alpha'
+
+    supply(
+      package_name: ENV['app_identifier'],
+      track: source_track,
+      rollout: rollout_value,
+      metadata_path: metadata_android_path,
+      track_promote_to: promote_track,
+      version_code: version_code,
+      skip_upload_apk: true,
+      skip_upload_aab: true,
+      skip_upload_metadata: true,
+      skip_upload_images: true,
+      skip_upload_screenshots: true
+    )
+
+    chatbot_telegram(release_to: promote_track)
+  end
+
+  desc "Telegram chatbot send a message"
+  lane :chatbot_telegram do |options|
+    type = options[:type] || 'Beta'
+    app_name = options[:app_name] || 'DEFAULT APP NAME'
+    platform = options[:platform] || 'Android'
+    release_to = options[:release_to] || 'internal'
+    release_to = release_to.capitalize << ' Testing'
+    message = options[:message] || ''
+    version_name_value = options[:version_number] || version_name
+    version_code_value = options[:build_number] || version_code
+
+    # Increment build number to current date
+    current_date_time = Time.new.strftime("%A, %B %d, %Y - %I:%M:%S %p")
+
+    telegram(
+      token: "YOUR_TOKEN",
+      chat_id: "YOUR_CHAT_ID",
+      text: "**#{type}** - #{current_date_time}\n\n#{message} #{app_name} #{platform} was released to #{release_to} with version: #{version_name_value} - Build(#{version_code_value})",
+    )
+  end
+
+  after_all do |lane, options|
+    #slack(message: message)
+  end
+end
